@@ -1,0 +1,146 @@
+name: Build PocketTavern Vision APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/vision-apk.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Patch Kotlin source for Multimodal Vision support
+        run: |
+          python3 - << 'EOF'
+          import pathlib
+
+          # 1. Патчим OpenAiService.kt / ClaudeService.kt / GeminiService.kt:
+          # Если в тексте сообщения есть маркер [[PT_IMG:base64]], превращаем content в мультимодальный формат API
+          oa_path = pathlib.Path("app/src/main/java/com/pockettavern/app/data/remote/OpenAiService.kt")
+          oa_text = oa_path.read_text()
+
+          helper_fn = '''
+              private fun buildMultimodalContent(rawContent: String): Any {
+                  val marker = "[[PT_IMG:"
+                  if (!rawContent.contains(marker)) return rawContent
+                  val start = rawContent.indexOf(marker)
+                  val end = rawContent.indexOf("]]", start)
+                  if (end == -1) return rawContent
+                  val b64 = rawContent.substring(start + marker.length, end)
+                  val cleanText = (rawContent.substring(0, start) + rawContent.substring(end + 2)).trim().ifEmpty { "Describe or react to this image." }
+                  return listOf(
+                      mapOf("type" to "text", "text" to cleanText),
+                      mapOf("type" to "image_url", "image_url" to mapOf("url" to "data:image/jpeg;base64,$b64"))
+                  )
+              }
+          '''
+
+          oa_text = oa_text.replace(
+              'mapOf("role" to m.role, "content" to m.content)',
+              'mapOf("role" to m.role, "content" to buildMultimodalContent(m.content))'
+          )
+          oa_text = oa_text.replace(
+              'class OpenAiService @Inject constructor(',
+              'class OpenAiService @Inject constructor('
+          )
+          # Вставляем helper перед последней закрывающей скобкой класса
+          last_brace = oa_text.rfind('}')
+          oa_text = oa_text[:last_brace] + helper_fn + "\n}\n"
+          oa_path.write_text(oa_text)
+
+          # 2. Патчим ChatScreen.kt: добавляем кнопку выбора картинки из галереи Android в нижнюю панель ввода
+          cs_path = pathlib.Path("app/src/main/java/com/pockettavern/app/ui/screens/chat/ChatScreen.kt")
+          cs_text = cs_path.read_text()
+
+          # Добавляем нужные импорты для работы с Bitmap и Base64
+          imports = """import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.util.Base64
+          import java.io.ByteArrayOutputStream
+          import androidx.compose.material.icons.filled.Image
+          """
+          cs_text = cs_text.replace("import android.net.Uri", "import android.net.Uri\n" + imports)
+
+          # Добавляем лаунчер галереи для прикрепления фото к сообщению в ChatInputBar
+          picker_code = """
+          val visionContext = LocalContext.current
+          val visionPicker = rememberLauncherForActivityResult(
+              contract = ActivityResultContracts.GetContent()
+          ) { uri: Uri? ->
+              uri?.let {
+                  try {
+                      visionContext.contentResolver.openInputStream(it)?.use { stream ->
+                          val original = BitmapFactory.decodeStream(stream)
+                          if (original != null) {
+                              val maxDim = 1024
+                              val ratio = minOf(maxDim.toFloat() / original.width, maxDim.toFloat() / original.height, 1f)
+                              val scaled = Bitmap.createScaledBitmap(
+                                  original,
+                                  (original.width * ratio).toInt().coerceAtLeast(1),
+                                  (original.height * ratio).toInt().coerceAtLeast(1),
+                                  true
+                              )
+                              val out = ByteArrayOutputStream()
+                              scaled.compress(Bitmap.CompressFormat.JPEG, 82, out)
+                              val b64 = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+                              onInputTextChanged(inputText + " [[PT_IMG:$b64]]")
+                          }
+                      }
+                  } catch (_: Exception) {}
+              }
+          }
+          """
+
+          cs_text = cs_text.replace(
+              "var showMenu by remember { mutableStateOf(false) }",
+              "var showMenu by remember { mutableStateOf(false) }\n" + picker_code
+          )
+
+          # Добавляем кнопку иконки картинки рядом с меню "+" в нижней панели чата
+          vision_btn = """
+                      IconButton(
+                          onClick = { visionPicker.launch("image/*") },
+                          enabled = !isStreaming,
+                          modifier = Modifier.size(36.dp)
+                      ) {
+                          Icon(
+                              Icons.Default.Image,
+                              contentDescription = "Attach Image for Vision",
+                              tint = if (inputText.contains("[[PT_IMG:")) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                          )
+                      }
+          """
+
+          target_anchor = 'Icon(Icons.Default.Add, contentDescription = "More options")'
+          idx = cs_text.find(target_anchor)
+          if idx != -1:
+              close_btn_idx = cs_text.find("}", idx)
+              close_btn_idx = cs_text.find("}", close_btn_idx + 1)
+              cs_text = cs_text[:close_btn_idx + 1] + "\n" + vision_btn + cs_text[close_btn_idx + 1:]
+
+          cs_path.write_text(cs_text)
+          print("Successfully patched OpenAiService.kt and ChatScreen.kt!")
+          EOF
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Upload Compiled APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PocketTavern-Vision-APK
+          path: app/build/outputs/apk/debug/*.apk
