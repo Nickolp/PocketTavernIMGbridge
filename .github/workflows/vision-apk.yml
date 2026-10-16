@@ -6,30 +6,31 @@ on:
     paths:
       - '.github/workflows/vision-apk.yml'
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@main
 
       - name: Patch Kotlin source for Multimodal Vision support
         run: |
           python3 - << 'EOF'
           import pathlib
 
-          # 1. Патчим OpenAiCompatibleApi.kt: меняем content: String на JsonElement,
-          # чтобы поддерживать и обычный текст, и мультимодальный массив с картинкой
+          # 1. Патчим OpenAiCompatibleApi.kt: меняем content: String на JsonElement
           api_path = pathlib.Path("app/src/main/kotlin/com/pockettavern/app/data/remote/api/OpenAiCompatibleApi.kt")
           api_text = api_path.read_text()
           api_text = api_text.replace(
-              "data class OaiMessage(\n    val role: String, // \"system\", \"user\", \"assistant\"\n    val content: String\n)",
-              "data class OaiMessage(\n    val role: String,\n    val content: kotlinx.serialization.json.JsonElement\n)"
+              'val role: String, // "system", "user", "assistant"\n    val content: String',
+              'val role: String,\n    val content: kotlinx.serialization.json.JsonElement'
           )
           api_path.write_text(api_text)
 
-          # 2. Патчим LlmRepository.kt: если в сообщении есть ![image](data:image/jpeg;base64,...),
-          # автоматически собираем мультимодальный JSON массив [{"type":"text",...}, {"type":"image_url",...}]
+          # 2. Патчим LlmRepository.kt: превращаем ![image](data:image/...) в мультимодальный массив
           repo_path = pathlib.Path("app/src/main/kotlin/com/pockettavern/app/data/repository/LlmRepository.kt")
           repo_text = repo_path.read_text()
 
@@ -62,10 +63,11 @@ jobs:
               "m.content.lines()",
               "m.content.toString().lines()"
           )
-          repo_text = repo_text + "\n" + multimodal_helper
+          last_brace = repo_text.rfind("}")
+          repo_text = repo_text[:last_brace] + "\n" + multimodal_helper + "\n}\n"
           repo_path.write_text(repo_text)
 
-          # 3. Патчим MessageInput.kt: добавляем кнопку выбора картинки (иконка Image) с сохранением пропорций!
+          # 3. Патчим MessageInput.kt: добавляем кнопку выбора картинки с сохранением пропорций
           input_path = pathlib.Path("app/src/main/kotlin/com/pockettavern/app/ui/components/MessageInput.kt")
           input_text = input_path.read_text()
 
@@ -163,20 +165,21 @@ jobs:
           EOF
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@main
         with:
           java-version: '17'
           distribution: 'temurin'
-          cache: gradle
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew
+      - name: Setup Gradle 8.9
+        uses: gradle/actions/setup-gradle@main
+        with:
+          gradle-version: '8.9'
 
       - name: Build Debug APK
-        run: ./gradlew assembleDebug --stacktrace
+        run: gradle assembleDebug --stacktrace
 
       - name: Upload Compiled APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@main
         with:
           name: PocketTavern-Vision-APK
           path: app/build/outputs/apk/debug/*.apk
