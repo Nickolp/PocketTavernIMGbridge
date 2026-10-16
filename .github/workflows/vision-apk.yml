@@ -15,34 +15,28 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@main
-        with:
-          submodules: recursive
 
-      - name: Extract prebuilt native C++ libs from official release APK & Patch Vision
+      - name: Patch build.gradle.kts and Kotlin sources for Vision
         run: |
-          # 1. Скачиваем официальный APK v2.3.7 и достаём из него уже скомпилированные C++ библиотеки (libmnn*.so),
-          # чтобы не компилировать CMake/MNN с нуля и обойти пустую папку app/src/main/cpp/MNN
-          curl -L -s -o official.apk https://github.com/Starkka15/PocketTavern/releases/download/v2.3.7/app-debug.apk
-          mkdir -p app/src/main/jniLibs/arm64-v8a
-          unzip -j official.apk "lib/arm64-v8a/*" -d app/src/main/jniLibs/arm64-v8a/
-          rm -f official.apk
-          ls -la app/src/main/jniLibs/arm64-v8a/
-
           python3 - << 'EOF'
           import pathlib, re
 
-          # 2. Отключаем externalNativeBuild (CMake) в app/build.gradle.kts, т.к. все .so уже лежат в jniLibs!
+          # 1. Отключаем экспериментальный CMake/MNN в app/build.gradle.kts (как в официальном релизе автора)
           gradle_path = pathlib.Path("app/build.gradle.kts")
           gradle_text = gradle_path.read_text()
+          gradle_text = gradle_text.replace(
+              'buildConfigField("boolean", "MNN_SDXL_ENABLED", "true")',
+              'buildConfigField("boolean", "MNN_SDXL_ENABLED", "false")'
+          )
           gradle_text = re.sub(
               r'externalNativeBuild\s*\{\s*cmake\s*\{[^}]*\}\s*\}',
-              '// externalNativeBuild bypassed (using prebuilt jniLibs from official release)',
+              '',
               gradle_text
           )
+          assert "externalNativeBuild" not in gradle_text, "Failed to strip externalNativeBuild"
           gradle_path.write_text(gradle_text)
 
-          # 3. Патчим OpenAiCompatibleApi.kt:
-          # Добавляем OaiRequestMessage с JsonElement для отправки, а OaiMessage оставляем со String для чтения ответа
+          # 2. Патчим OpenAiCompatibleApi.kt: добавляем OaiRequestMessage с JsonElement для отправки
           api_path = pathlib.Path("app/src/main/kotlin/com/pockettavern/app/data/remote/api/OpenAiCompatibleApi.kt")
           api_text = api_path.read_text()
 
@@ -63,57 +57,49 @@ jobs:
               "@Serializable\ndata class OaiMessage(",
               req_msg_class + "\n@Serializable\ndata class OaiMessage("
           )
+          assert "OaiRequestMessage" in api_text, "Failed to patch OpenAiCompatibleApi.kt"
           api_path.write_text(api_text)
 
-          # 4. Патчим LlmRepository.kt: используем OaiRequestMessage для отправки мультимодального JSON
+          # 3. Патчим LlmRepository.kt: добавляем top-level функцию toMultimodalJsonElement в конец файла
           repo_path = pathlib.Path("app/src/main/kotlin/com/pockettavern/app/data/repository/LlmRepository.kt")
           repo_text = repo_path.read_text()
 
-          repo_text = repo_text.replace(
-              "import com.pockettavern.app.data.remote.api.OaiMessage",
-              "import com.pockettavern.app.data.remote.api.OaiMessage\nimport com.pockettavern.app.data.remote.api.OaiRequestMessage"
-          )
-
           multimodal_helper = '''
-              private fun toMultimodalJsonElement(raw: String): kotlinx.serialization.json.JsonElement {
-                  val marker = "![image](data:image/"
-                  val startIdx = raw.indexOf(marker)
-                  if (startIdx == -1) return kotlinx.serialization.json.JsonPrimitive(raw)
-                  val urlStart = startIdx + 9
-                  val endIdx = raw.indexOf(")", urlStart)
-                  if (endIdx == -1) return kotlinx.serialization.json.JsonPrimitive(raw)
-                  val dataUri = raw.substring(urlStart, endIdx)
-                  val fullTag = raw.substring(startIdx, endIdx + 1)
-                  val cleanText = raw.replace(fullTag, "").trim().ifEmpty { "Look at this image." }
-                  return kotlinx.serialization.json.buildJsonArray {
-                      add(kotlinx.serialization.json.buildJsonObject {
-                          put("type", kotlinx.serialization.json.JsonPrimitive("text"))
-                          put("text", kotlinx.serialization.json.JsonPrimitive(cleanText))
+          private fun toMultimodalJsonElement(raw: String): kotlinx.serialization.json.JsonElement {
+              val marker = "![image](data:image/"
+              val startIdx = raw.indexOf(marker)
+              if (startIdx == -1) return kotlinx.serialization.json.JsonPrimitive(raw)
+              val urlStart = startIdx + 9
+              val endIdx = raw.indexOf(")", urlStart)
+              if (endIdx == -1) return kotlinx.serialization.json.JsonPrimitive(raw)
+              val dataUri = raw.substring(urlStart, endIdx)
+              val fullTag = raw.substring(startIdx, endIdx + 1)
+              val cleanText = raw.replace(fullTag, "").trim().ifEmpty { "Look at this image." }
+              return kotlinx.serialization.json.buildJsonArray {
+                  add(kotlinx.serialization.json.buildJsonObject {
+                      put("type", kotlinx.serialization.json.JsonPrimitive("text"))
+                      put("text", kotlinx.serialization.json.JsonPrimitive(cleanText))
+                  })
+                  add(kotlinx.serialization.json.buildJsonObject {
+                      put("type", kotlinx.serialization.json.JsonPrimitive("image_url"))
+                      put("image_url", kotlinx.serialization.json.buildJsonObject {
+                          put("url", kotlinx.serialization.json.JsonPrimitive(dataUri))
                       })
-                      add(kotlinx.serialization.json.buildJsonObject {
-                          put("type", kotlinx.serialization.json.JsonPrimitive("image_url"))
-                          put("image_url", kotlinx.serialization.json.buildJsonObject {
-                              put("url", kotlinx.serialization.json.JsonPrimitive(dataUri))
-                          })
-                      })
-                  }
+                  })
               }
+          }
           '''
 
-          repo_text = repo_text.replace(
-              'val oaiMessages = messages?.map { OaiMessage(it.role, it.content) }\n            ?: listOf(OaiMessage("user", prompt))',
-              'val oaiMessages = messages?.map { OaiRequestMessage(it.role, toMultimodalJsonElement(it.content)) }\n            ?: listOf(OaiRequestMessage("user", toMultimodalJsonElement(prompt)))'
-          )
-          repo_text = repo_text.replace(
-              "m.content.lines()",
-              "m.content.toString().lines()"
-          )
+          old_oai_block = 'val oaiMessages = messages?.map { OaiMessage(it.role, it.content) }\n            ?: listOf(OaiMessage("user", prompt))'
+          new_oai_block = 'val oaiMessages = messages?.map { OaiRequestMessage(it.role, toMultimodalJsonElement(it.content)) }\n            ?: listOf(OaiRequestMessage("user", toMultimodalJsonElement(prompt)))'
+          assert old_oai_block in repo_text, "Failed to find oaiMessages block in LlmRepository.kt"
 
-          last_brace = repo_text.rfind("}")
-          repo_text = repo_text[:last_brace] + "\n" + multimodal_helper + "\n}\n"
+          repo_text = repo_text.replace(old_oai_block, new_oai_block)
+          repo_text = repo_text.replace("m.content.lines()", "m.content.toString().lines()")
+          repo_text = repo_text + "\n" + multimodal_helper + "\n"
           repo_path.write_text(repo_text)
 
-          # 5. Патчим MessageInput.kt: добавляем кнопку выбора картинки с сохранением пропорций
+          # 4. Патчим MessageInput.kt: добавляем кнопку выбора картинки (иконка Image) с сохранением пропорций
           input_path = pathlib.Path("app/src/main/kotlin/com/pockettavern/app/ui/components/MessageInput.kt")
           input_text = input_path.read_text()
 
@@ -162,29 +148,30 @@ jobs:
           """
 
           input_text = input_text.replace(
-              "Surface(",
-              picker_block + "\n    Surface("
+              "    Surface(",
+              picker_block + "\n    Surface(",
+              1
           )
 
           image_button_ui = """
-              IconButton(
-                  onClick = {
-                      if (attachedImageUri != null) {
-                          attachedImageUri = null
-                      } else {
-                          imagePicker.launch("image/*")
+                      IconButton(
+                          onClick = {
+                              if (attachedImageUri != null) {
+                                  attachedImageUri = null
+                              } else {
+                                  imagePicker.launch("image/*")
+                              }
+                          },
+                          enabled = enabled
+                      ) {
+                          Icon(
+                              imageVector = Icons.Default.Image,
+                              contentDescription = "Attach image",
+                              tint = if (attachedImageUri != null) MaterialTheme.colorScheme.primary
+                                     else if (enabled) MaterialTheme.colorScheme.onSurfaceVariant
+                                     else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                          )
                       }
-                  },
-                  enabled = enabled
-              ) {
-                  Icon(
-                      imageVector = Icons.Default.Image,
-                      contentDescription = "Attach image",
-                      tint = if (attachedImageUri != null) MaterialTheme.colorScheme.primary
-                             else if (enabled) MaterialTheme.colorScheme.onSurfaceVariant
-                             else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
-                  )
-              }
           """
 
           input_text = input_text.replace(
@@ -192,22 +179,22 @@ jobs:
               image_button_ui + "\n            if (onVoiceInput != null) {"
           )
 
-          input_text = input_text.replace(
-              "onClick = onSend,\n                enabled = enabled && value.isNotBlank(),",
-              """onClick = {
-                  val img = attachedImageUri
-                  if (img != null) {
-                      val prefix = if (value.isBlank()) "" else "$value\\n\\n"
-                      onValueChange(prefix + "![image]($img)")
-                      attachedImageUri = null
-                  }
-                  onSend()
-              },
-              enabled = enabled && (value.isNotBlank() || attachedImageUri != null),"""
-          )
+          old_send_block = "onClick = onSend,\n                enabled = enabled && value.isNotBlank(),"
+          new_send_block = """onClick = {
+                          val img = attachedImageUri
+                          if (img != null) {
+                              val prefix = if (value.isBlank()) "" else "$value\\n\\n"
+                              onValueChange(prefix + "![image]($img)")
+                              attachedImageUri = null
+                          }
+                          onSend()
+                      },
+                      enabled = enabled && (value.isNotBlank() || attachedImageUri != null),"""
+          assert old_send_block in input_text, "Failed to find onSend block in MessageInput.kt"
+          input_text = input_text.replace(old_send_block, new_send_block)
 
           input_path.write_text(input_text)
-          print("Successfully extracted native libs and patched Kotlin files!")
+          print("All 4 files patched and verified with assertions!")
           EOF
 
       - name: Set up JDK 17
