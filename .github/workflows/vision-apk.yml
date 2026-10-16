@@ -11,7 +11,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@main
@@ -21,48 +21,74 @@ jobs:
           python3 - << 'EOF'
           import pathlib
 
-          # 1. Патчим OpenAiCompatibleApi.kt: меняем content: String на JsonElement
+          # 1. Патчим OpenAiCompatibleApi.kt:
+          # Добавляем OaiRequestMessage с JsonElement для отправки, а OaiMessage оставляем со String для чтения ответа!
           api_path = pathlib.Path("app/src/main/kotlin/com/pockettavern/app/data/remote/api/OpenAiCompatibleApi.kt")
           api_text = api_path.read_text()
+
           api_text = api_text.replace(
-              'val role: String, // "system", "user", "assistant"\n    val content: String',
-              'val role: String,\n    val content: kotlinx.serialization.json.JsonElement'
+              "val messages: List<OaiMessage>,",
+              "val messages: List<OaiRequestMessage>,"
+          )
+
+          req_msg_class = """
+          @Serializable
+          data class OaiRequestMessage(
+              val role: String,
+              val content: kotlinx.serialization.json.JsonElement
+          )
+          """
+
+          api_text = api_text.replace(
+              "@Serializable\ndata class OaiMessage(",
+              req_msg_class + "\n@Serializable\ndata class OaiMessage("
           )
           api_path.write_text(api_text)
 
-          # 2. Патчим LlmRepository.kt: превращаем ![image](data:image/...) в мультимодальный массив
+          # 2. Патчим LlmRepository.kt: используем OaiRequestMessage для отправки мультимодального JSON
           repo_path = pathlib.Path("app/src/main/kotlin/com/pockettavern/app/data/repository/LlmRepository.kt")
           repo_text = repo_path.read_text()
 
+          repo_text = repo_text.replace(
+              "import com.pockettavern.app.data.remote.api.OaiMessage",
+              "import com.pockettavern.app.data.remote.api.OaiMessage\nimport com.pockettavern.app.data.remote.api.OaiRequestMessage"
+          )
+
           multimodal_helper = '''
-          private fun toMultimodalJsonElement(raw: String): kotlinx.serialization.json.JsonElement {
-              val regex = Regex("""!\\[[^\\]]*\\]\\((data:image/[^)]+)\\)""")
-              val match = regex.find(raw) ?: return kotlinx.serialization.json.JsonPrimitive(raw)
-              val dataUri = match.groupValues[1]
-              val cleanText = raw.replace(match.value, "").trim().ifEmpty { "Look at this image." }
-              return kotlinx.serialization.json.buildJsonArray {
-                  add(kotlinx.serialization.json.buildJsonObject {
-                      put("type", kotlinx.serialization.json.JsonPrimitive("text"))
-                      put("text", kotlinx.serialization.json.JsonPrimitive(cleanText))
-                  })
-                  add(kotlinx.serialization.json.buildJsonObject {
-                      put("type", kotlinx.serialization.json.JsonPrimitive("image_url"))
-                      put("image_url", kotlinx.serialization.json.buildJsonObject {
-                          put("url", kotlinx.serialization.json.JsonPrimitive(dataUri))
+              private fun toMultimodalJsonElement(raw: String): kotlinx.serialization.json.JsonElement {
+                  val marker = "![image](data:image/"
+                  val startIdx = raw.indexOf(marker)
+                  if (startIdx == -1) return kotlinx.serialization.json.JsonPrimitive(raw)
+                  val urlStart = startIdx + 9
+                  val endIdx = raw.indexOf(")", urlStart)
+                  if (endIdx == -1) return kotlinx.serialization.json.JsonPrimitive(raw)
+                  val dataUri = raw.substring(urlStart, endIdx)
+                  val fullTag = raw.substring(startIdx, endIdx + 1)
+                  val cleanText = raw.replace(fullTag, "").trim().ifEmpty { "Look at this image." }
+                  return kotlinx.serialization.json.buildJsonArray {
+                      add(kotlinx.serialization.json.buildJsonObject {
+                          put("type", kotlinx.serialization.json.JsonPrimitive("text"))
+                          put("text", kotlinx.serialization.json.JsonPrimitive(cleanText))
                       })
-                  })
+                      add(kotlinx.serialization.json.buildJsonObject {
+                          put("type", kotlinx.serialization.json.JsonPrimitive("image_url"))
+                          put("image_url", kotlinx.serialization.json.buildJsonObject {
+                              put("url", kotlinx.serialization.json.JsonPrimitive(dataUri))
+                          })
+                      })
+                  }
               }
-          }
           '''
 
           repo_text = repo_text.replace(
               'val oaiMessages = messages?.map { OaiMessage(it.role, it.content) }\n            ?: listOf(OaiMessage("user", prompt))',
-              'val oaiMessages = messages?.map { OaiMessage(it.role, toMultimodalJsonElement(it.content)) }\n            ?: listOf(OaiMessage("user", toMultimodalJsonElement(prompt)))'
+              'val oaiMessages = messages?.map { OaiRequestMessage(it.role, toMultimodalJsonElement(it.content)) }\n            ?: listOf(OaiRequestMessage("user", toMultimodalJsonElement(prompt)))'
           )
           repo_text = repo_text.replace(
               "m.content.lines()",
               "m.content.toString().lines()"
           )
+
           last_brace = repo_text.rfind("}")
           repo_text = repo_text[:last_brace] + "\n" + multimodal_helper + "\n}\n"
           repo_path.write_text(repo_text)
@@ -161,7 +187,7 @@ jobs:
           )
 
           input_path.write_text(input_text)
-          print("All 3 files patched successfully!")
+          print("All 3 files patched cleanly!")
           EOF
 
       - name: Set up JDK 17
@@ -170,10 +196,10 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Gradle 8.9
+      - name: Setup Gradle
         uses: gradle/actions/setup-gradle@main
         with:
-          gradle-version: '8.9'
+          gradle-version: '8.11.1'
 
       - name: Build Debug APK
         run: gradle assembleDebug --stacktrace
